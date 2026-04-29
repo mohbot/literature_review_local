@@ -150,8 +150,8 @@ def main():
         help="Path to the folder containing PDF files (default: papers)",
     )
     parser.add_argument(
-        "llm_model", nargs="?", default="gemma4:26b",
-        help="Ollama LLM model to use (default: gemma4:26b)",
+        "llm_model", nargs="?", default="gemma3:4b",
+        help="Ollama LLM model to use (default: gemma3:4b)",
     )
     parser.add_argument(
         "--output", "-o", default="summaries",
