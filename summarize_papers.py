@@ -2,7 +2,7 @@
 """
 Summarize academic papers from a directory of PDFs using local LLMs via Ollama.
 Extracts titles and years from each PDF, generates structured summaries,
-and outputs a combined markdown file.
+and outputs combined markdown and PDF files.
 
 Only new/updated papers are sent to the LLM -- previously summarized papers
 are loaded from a cache file and reused.
@@ -11,7 +11,7 @@ Usage:
     python summarize_papers.py
     python summarize_papers.py /path/to/pdfs
     python summarize_papers.py /path/to/pdfs llama3.2
-    python summarize_papers.py /path/to/pdfs llama3.2 -o output_dir
+    python summarize_papers.py /path/to/pdfs -o output_dir
 """
 
 import os
@@ -24,7 +24,8 @@ from pathlib import Path
 from datetime import datetime
 
 import requests
-import fitz          # PyMuPDF
+import fitz                   # PyMuPDF
+from markdown_pdf import MarkdownPdf, Section
 
 # --- Config -------------------------------------------------------------------
 OLLAMA_BASE = os.environ.get("OLLAMA_BASE", "http://localhost:11434")
@@ -75,22 +76,61 @@ def extract_text(pdf_path, max_pages=5):
             text += doc[i].get_text()
         doc.close()
     except Exception as e:
-        print(f"    [WARN] Text extraction failed: {e}")
+        print(f"        [WARN] Text extraction failed: {e}")
     return strip_references_and_acknowledgements(text)
 
 
 def extract_title_and_year(pdf_path, text):
-    """Extract title and year from filename and PDF text."""
+    """Extract title and year from PDF text content (not filename)."""
+    filename = Path(pdf_path).stem
+    fallback_title = re.sub(r'[_\-\s]+', ' ', filename)
+    fallback_title = re.sub(r'\s+', ' ', fallback_title).strip()
+    fallback_title = fallback_title.replace(".pdf", "").strip()
+
+    # Extract title from first substantial line in PDF text
+    text_lines = text.split('\n')
+    title = fallback_title
+    for line in text_lines:
+        stripped = line.strip()
+        if len(stripped) < 10 or len(stripped.split()) < 4:
+            continue
+        if re.match(r'^[#\*\d\-\[\]]+', stripped):
+            continue
+        title = stripped
+        break
+
     year_match = re.search(r'\b(20\d{2})\b', text)
     year = year_match.group(1) if year_match else "Unknown"
-    filename = Path(pdf_path).stem
-    title = re.sub(r'[_\-\s]+', ' ', filename)
-    title = re.sub(r'\s+', ' ', title).strip()
-    title = title.replace(".pdf", "").strip()
     return title, year
 
 
 # --- Cache management ---------------------------------------------------------
+
+_TITLE_INDEX_KEY = "_title_index"
+_TEXT_HASH_KEY = "_text_hashes"
+
+def _text_hash(text):
+    """Compute a short hash for deduplication."""
+    import hashlib
+    return hashlib.sha256(text.strip().encode()).hexdigest()[:16]
+
+
+def _normalize_title(title):
+    """Normalize a title for deduplication: lowercase, strip punctuation."""
+    title = title.lower().strip()
+    title = re.sub(r'[^a-z0-9\s]', '', title)
+    title = re.sub(r'\s+', ' ', title).strip()
+    return title
+
+
+def _title_overlap(norm_a, norm_b):
+    """Check if two normalized titles share enough tokens to be the same paper."""
+    tokens_a = set(norm_a.split())
+    tokens_b = set(norm_b.split())
+    if not tokens_a or not tokens_b:
+        return False
+    return len(tokens_a & tokens_b) >= 3
+
 
 def load_cache(cache_path):
     """Load the cache of already-summarized papers."""
@@ -104,6 +144,21 @@ def save_cache(cache_path, cache):
     """Save the cache of summarized papers."""
     with open(cache_path, "w", encoding="utf-8") as f:
         json.dump(cache, f, indent=2, ensure_ascii=False)
+
+
+def build_title_index(cache):
+    """Build a lookup from normalized title -> filename for all cached papers."""
+    index = {}
+    for fname, entry in cache.items():
+        if fname == _TITLE_INDEX_KEY:
+            continue
+        if isinstance(entry, dict):
+            title = entry.get("title", fname)
+        else:
+            title = entry
+        norm = _normalize_title(title)
+        index[norm] = fname
+    return index
 
 
 # --- Ollama API ---------------------------------------------------------------
@@ -150,12 +205,12 @@ def main():
         help="Path to the folder containing PDF files (default: papers)",
     )
     parser.add_argument(
-        "llm_model", nargs="?", default="gemma3:4b",
-        help="Ollama LLM model to use (default: gemma3:4b)",
+        "llm_model", nargs="?", default="gemma4:26b",
+        help="Ollama LLM model to use (default: gemma4:26b)",
     )
     parser.add_argument(
         "--output", "-o", default="summaries",
-        help="Output directory for the markdown file (default: summaries)",
+        help="Output directory for summaries (default: summaries)",
     )
     args = parser.parse_args()
 
@@ -175,78 +230,133 @@ def main():
 
     # Load cache of previously summarized papers
     cache = load_cache(cache_path)
-    cached_count = len(cache)
-    new_count = len(pdf_paths) - cached_count
+    title_index = build_title_index(cache)
+    cached_count = len([k for k in cache if k != _TITLE_INDEX_KEY])
 
     print(f"Using LLM model: {LLM_MODEL}\n")
     print(f"Found {len(pdf_paths)} PDF(s) in '{PDF_DIR}/'")
     if cached_count:
-        print(f"Already cached: {cached_count} paper(s)")
-        print(f"New papers to summarize: {new_count}\n")
+        print(f"Already cached: {cached_count} paper(s)\n")
     else:
         print()
 
-    results = []
+    new_summaries = []
     processed_count = 0
 
     for i, pdf_path in enumerate(pdf_paths, 1):
         filename = Path(pdf_path).name
-        already_cached = filename in cache
 
-        if already_cached:
-            print(f"[{i}/{len(pdf_paths)}] Skipping (cached): {filename}")
-            continue
-
-        print(f"[{i}/{len(pdf_paths)}] Processing: {filename}")
-
-        # Extract text
+           # Compute text hash to check against cache
         text = extract_text(pdf_path)
         if not text:
-            results.append((filename, "Unknown", "Could not extract text from PDF."))
-            print("  Skipped (empty text)\n")
+            print(f"[{i}/{len(pdf_paths)}] Skipped (empty text): {filename}\n")
             continue
 
-        # Extract title and year
-        title, year = extract_title_and_year(pdf_path, text)
-        print(f"  Title: {title}")
-        print(f"  Year:       {year}")
+        text_hash = _text_hash(text)
+        text_hashes = cache.get(_TEXT_HASH_KEY, {})
+        if text_hash in text_hashes:
+            cached_fname = text_hashes[text_hash]
+            entry = cache[cached_fname]
+            if isinstance(entry, dict):
+                title = entry.get("title", filename)
+                summary = entry.get("summary", "No summary available.")
+            else:
+                title = entry
+                summary = "Summary unavailable (legacy cache). Re-processing..."
+                print(f"[{i}/{len(pdf_paths)}] [WARN] Legacy cache for {filename}, re-processing...")
+            print(f"[{i}/{len(pdf_paths)}] Loaded from cache (hash match): {title}\n")
+            continue
 
-        # Generate summary with LLM
+           # Extract title and year
+        title, year = extract_title_and_year(pdf_path, text)
+        print(f"[{i}/{len(pdf_paths)}] Processing: {filename}")
+        print(f"  Title: {title}")
+        print(f"  Year:   {year}")
+
+           # Generate summary with LLM
         summary = summarize_with_ollama(text, LLM_MODEL)
         print(f"  Summary: {summary[:120]}...\n")
 
-        # Update cache
-        cache[filename] = title
-        results.append((title, year, summary))
+           # Update cache with hash and title index
+        cache[filename] = {"title": title, "summary": summary}
+        norm_title = _normalize_title(title)
+        title_index[norm_title] = filename
+        text_hashes[text_hash] = filename
+        cache[_TEXT_HASH_KEY] = text_hashes
+        new_summaries.append((title, year, summary))
         processed_count += 1
 
-        # Save cache after each paper to avoid losing progress
+           # Save cache after each paper to avoid losing progress
         save_cache(cache_path, cache)
 
-    # Save final cache
+     # Save final cache
     save_cache(cache_path, cache)
 
-    # Write markdown output
+       # Append new summaries to the latest summary.md
     os.makedirs(MD_DIR, exist_ok=True)
-    output_file = os.path.join(MD_DIR, "summaries.md")
+    existing_files = sorted(glob.glob(os.path.join(MD_DIR, "summaries_*.md")))
+    latest_md = existing_files[-1] if existing_files else None
 
-    with open(output_file, "w", encoding="utf-8") as f:
-        f.write("# Paper Summaries\n\n")
-        f.write(f"Total papers: {len(results)}\n\n")
-        f.write(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}\n\n")
-        f.write("---\n\n")
-        for title, year, summary in results:
-            f.write(f"## {title}\n\n")
-            f.write(f"**Year:** {year}\n\n")
-            f.write(f"{summary}\n\n")
-            f.write("---\n\n")
+    if new_summaries:
+        target_file = latest_md
+        if target_file is None:
+            timestamp = datetime.now().strftime('%Y-%m-%d_%H%M')
+            target_file = os.path.join(MD_DIR, f"summaries_{timestamp}.md")
 
-    print(f"Done! Written summaries to '{output_file}'")
-    if processed_count:
-        print(f"   {processed_count} new paper(s) summarized.")
+        with open(target_file, "a", encoding="utf-8") as f:
+            if latest_md is None:
+                # First run: write header
+                f.write("# Paper Summaries\n\n")
+                f.write(f"Total papers: 0\n\n")
+                f.write(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}\n\n")
+                f.write("---\n\n")
+            for title, year, summary in new_summaries:
+                f.write(f"## {title}\n\n")
+                f.write(f"**Year:** {year}\n\n")
+                f.write(f"{summary}\n\n")
+                f.write("---\n\n")
+            print(f"Appended {len(new_summaries)} summary(s) to '{os.path.basename(target_file)}'")
     else:
-        print("  No new papers to summarize.")
+        print("  No new papers to summarize. Existing summaries preserved.")
+
+     # Update total paper count in the latest summary file
+    existing_files = sorted(glob.glob(os.path.join(MD_DIR, "summaries_*.md")))
+    if existing_files:
+        latest = existing_files[-1]
+        try:
+            with open(latest, "r", encoding="utf-8") as f:
+                content = f.read()
+            # Count all ## headers (paper entries)
+            papers = re.findall(r"^## (.+)$", content, re.MULTILINE)
+            count_line = f"Total papers: {len(papers)}\n"
+            content = re.sub(r"Total papers: \d+", count_line, content)
+            with open(latest, "w", encoding="utf-8") as f:
+                f.write(content)
+            print(f"Updated total paper count in '{os.path.basename(latest)}'")
+        except Exception:
+            pass
+
+        # Also regenerate summaries.pdf from the latest .md
+        if new_summaries:
+            try:
+                 # Read the full .md content for PDF generation
+                target_md = latest_md
+                if target_md is None:
+                    target_md = target_file
+                with open(target_md, "r", encoding="utf-8") as f:
+                    md_content = f.read()
+                timestamp = datetime.now().strftime('%Y-%m-%d_%H%M')
+                pdf_file = os.path.join(MD_DIR, f"summaries_{timestamp}.pdf")
+                pdf = MarkdownPdf()
+                pdf.add_section(Section(md_content))
+                pdf.save(pdf_file)
+                print(f"Done! Written PDF summaries to '{pdf_file}'")
+            except ImportError:
+                pass
+            except Exception as e:
+                print(f"[WARN] PDF generation failed: {e}")
 
 
 if __name__ == "__main__":
     main()
+
